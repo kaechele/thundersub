@@ -154,7 +154,7 @@ Version 1.1.1 supersedes the unpublished 1.1.0 version. Version 1.1.0 was never 
 
 Source is plain, unminified JavaScript with no third-party runtime libraries. build.sh performs deterministic XPI packaging; the uploaded XPI contains the readable source (repo: https://github.com/SmarakNayak/thundersub).
 
-The background runs as an ES module via a background page (background.html): background.js imports the localized unsubscribe-wording list from unsub-detect.js (embedded unsubscribe links in 13 languages), the sender skip-pattern matcher from scan-scope.js, the unsubscribe URL safety gates from unsub-url.js, and account-ID-based junk-folder routing from junk-routing.js. All matching is local regex matching; no translation service or network involvement.
+The background runs as an ES module via a background page (background.html): background.js imports the localized unsubscribe-wording list from unsub-detect.js (embedded unsubscribe links in 13 languages), the sender skip-pattern matcher from scan-scope.js, the unsubscribe URL safety gates from unsub-url.js, account-ID-based junk-folder routing from junk-routing.js, and mailing list identification (List-Id, List-Post and list-manager headers) from list-identity.js. All matching is local regex matching; no translation service or network involvement.
 
 License: MPL-2.0. Portions of the unsubscribe detection and unsubscribe methods in background.js are adapted from BetterUnsubscribe by Luc Bennett (MPL-2.0, https://github.com/LucBennett/BetterUnsubscribe), with attribution in the file header and README. ThunderSub is an independent add-on with a different scope (whole-mailbox scanning, review queue, cleanup).
 
