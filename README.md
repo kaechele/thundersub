@@ -45,6 +45,8 @@ Services that do this for webmail exist — and they do it by reading your email
 ### 📬 Alias-aware grouping
 ThunderSub doesn't just group by sender — it groups by **(sender, receiving address, and account identity)**. If `news@example.com` mails both `you@work.com` and `you+shopping@gmail.com`, you'll see two cards, because those are two subscriptions that need two unsubscribes. The receiving address comes from delivery/recipient headers; the configured Thunderbird identity is tracked separately for filtering and mailto unsubscribe drafts.
 
+Mailing lists are grouped by **list** instead of by sender. Mail that carries a `List-Id` header (or, failing that, `List-Post`, `X-Mailing-List`, `Mailing-List` or `X-BeenThere`) becomes one card per list and receiving address, named after the list and showing how many people post to it. Unsubscribe uses that list's own methods, and cleanup covers every poster's messages. On discussion lists, replies count too: their list headers come from the list server, so only those headers are used, never links in the quoted body.
+
 ### ✂️ Four ways out
 For each sender, ThunderSub auto-selects the best available method:
 

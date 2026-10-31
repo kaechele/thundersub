@@ -10,6 +10,7 @@ import { UNSUB_REGEX, mayContainUnsubWording } from './unsub-detect.js';
 import { buildAddressSkipMatcher } from './scan-scope.js';
 import { oneClickUrlBlockReason, browserUrlBlockReason } from './unsub-url.js';
 import { junkFolderForGroup } from './junk-routing.js';
+import { listIdentity } from './list-identity.js';
 
 // ── State ────────────────────────────────────────────────────────────────────
 let scanState = {
@@ -43,8 +44,21 @@ function subscriptionKey(senderEmail, recipientAddress, accountIdentityAddress =
   ]);
 }
 
+// Mailing list subscriptions are keyed by list instead of sender. The leading
+// marker keeps them from colliding with a sender key.
+function listSubscriptionKey(listKey, recipientAddress, accountIdentityAddress = '') {
+  return JSON.stringify([
+    'list',
+    String(listKey || '').toLowerCase(),
+    String(recipientAddress || '').toLowerCase(),
+    String(accountIdentityAddress || '').toLowerCase()
+  ]);
+}
+
 function keyForSubscription(sub) {
-  return sub.subscriptionKey || subscriptionKey(
+  if (sub.subscriptionKey) return sub.subscriptionKey;
+  if (sub.isList) return listSubscriptionKey(sub.listKey, sub.recipientAddress, sub.accountIdentityAddress);
+  return subscriptionKey(
     sub.senderEmail,
     sub.recipientAddress,
     sub.accountIdentityAddress
@@ -314,16 +328,6 @@ function extractHeaderEmailAddresses(raw) {
     addresses.push(address);
   }
   return addresses;
-}
-
-function parseListId(headers = {}) {
-  const raw = (headers['list-id'] || [])[0];
-  if (!raw) return '';
-  const bracketed = raw.match(/<([^<>]+)>/);
-  return String(bracketed ? bracketed[1] : raw)
-    .trim()
-    .replace(/\s+/g, ' ')
-    .toLowerCase();
 }
 
 function isReplyOrForwardSubject(subject) {
@@ -737,6 +741,9 @@ function normalizeHeaderMessageId(value) {
   return String(raw || '').trim().replace(/^<|>$/g, '');
 }
 
+// Scan-time index of each group's header ids; list groups can hold thousands.
+const groupHeaderIdSets = new WeakMap();
+
 function addToMessageGroups(groups, accountName, folderName, folderId, msgId, headerMessageId) {
   let group = groups.find(g => g.accountName === accountName && g.folderName === folderName);
   if (!group) {
@@ -746,7 +753,13 @@ function addToMessageGroups(groups, accountName, folderName, folderId, msgId, he
   if (!group.folderId) group.folderId = folderId;
   group.sessionId = SESSION_ID;
   group.messageIds.push(msgId);
-  if (headerMessageId && !group.headerMessageIds.includes(headerMessageId)) {
+  let headerIds = groupHeaderIdSets.get(group);
+  if (!headerIds) {
+    headerIds = new Set(group.headerMessageIds);
+    groupHeaderIdSets.set(group, headerIds);
+  }
+  if (headerMessageId && !headerIds.has(headerMessageId)) {
+    headerIds.add(headerMessageId);
     group.headerMessageIds.push(headerMessageId);
   }
   group.messageCount = group.headerMessageIds.length || group.messageIds.length;
@@ -771,9 +784,8 @@ function getIdsForFolders(groups, selectedFolders) {
 // See: https://webextension-api.thunderbird.net/en/latest/messages.html#messages-messageid
 // Numeric ids created in this background session are current. Older ids are
 // re-resolved from stable RFC 5322 Message-ID headers within the group's folder.
-async function resolveCurrentMessageIds(groups, selectedFolders, senderEmail, traceId) {
+async function resolveCurrentMessageIds(groups, selectedFolders, allowedSenders, traceId) {
   const startedAt = Date.now();
-  const expectedSender = String(senderEmail || '').toLowerCase();
   const selected = selectGroupsForFolders(groups, selectedFolders);
   const ids = new Set();
   const unresolvedHeaderIds = new Set();
@@ -821,10 +833,10 @@ async function resolveCurrentMessageIds(groups, selectedFolders, senderEmail, tr
     }
     // Message-IDs are sender-supplied and can be forged to collide with an
     // unrelated message in the same folder. Only act on messages whose From
-    // matches the subscription, so a collision can't delete or move someone
-    // else's mail.
-    if (expectedSender) {
-      found = found.filter(message => parseFromHeader(message.author).email === expectedSender);
+    // matches the subscription (or one of a list's posters), so a collision
+    // can't delete or move someone else's mail.
+    if (allowedSenders) {
+      found = found.filter(message => allowedSenders.has(parseFromHeader(message.author).email));
     }
     const duration = Date.now() - queryStartedAt;
     targetedQueries++;
@@ -860,6 +872,15 @@ async function resolveCurrentMessageIds(groups, selectedFolders, senderEmail, tr
     unresolvedHeaderIds: [...unresolvedHeaderIds],
     cancelled: operationCancelled(traceId)
   };
+}
+
+// Senders whose messages cleanup may act on: every poster seen on a mailing
+// list, or the single sender otherwise.
+async function allowedSendersFor(key, senderEmail) {
+  const sub = (await loadSubscriptions()).find(s => keyForSubscription(s) === key);
+  if (sub?.isList) return new Set(sub.listPosters || []);
+  const expectedSender = String(senderEmail || '').toLowerCase();
+  return expectedSender ? new Set([expectedSender]) : null;
 }
 
 function getHeaderIdsForFolders(groups, selectedFolders) {
@@ -973,6 +994,25 @@ function withTimeout(promise, ms, label) {
   ]);
 }
 
+// Before list grouping, list mail was keyed by sender and kept the List-Id of
+// the first message seen. Carry a decision made on such a sender card over to
+// the list card that replaces it. Unsubscribed wins over kept: a sender card's
+// unsubscribe methods were the list's own.
+function migrateSenderDecisions(listSub, existing, migratedKeys) {
+  if (!listSub.listId) return null;
+  const recipient = String(listSub.recipientAddress || '').toLowerCase();
+  const identity = String(listSub.accountIdentityAddress || '').toLowerCase();
+  const candidates = existing.filter(prev =>
+    !prev.isList &&
+    prev.listId === listSub.listId &&
+    String(prev.recipientAddress || '').toLowerCase() === recipient &&
+    String(prev.accountIdentityAddress || '').toLowerCase() === identity &&
+    (prev.decision === 'keep' || prev.decision === 'unsubscribed'));
+  if (candidates.length === 0) return null;
+  for (const prev of candidates) migratedKeys.add(keyForSubscription(prev));
+  return candidates.find(prev => prev.decision === 'unsubscribed') || candidates[0];
+}
+
 async function runScan() {
   const startedAt = Date.now();
   scanState = { status: 'scanning', progress: 0, total: 0, folderProgress: 0, folderTotal: 0, currentFolder: '', messagesScanned: 0, sendersFound: 0, subscriptionEmailsFound: 0, message: 'Loading accounts...', done: false };
@@ -1026,9 +1066,141 @@ async function runScan() {
     scanState.message = `Scanning ${totalMessages.toLocaleString()} messages in ${allFolders.length} folders...`;
     console.log(`[ThunderSub] Scanning ~${totalMessages} messages in ${allFolders.length} folders across ${accounts.length} accounts`);
 
-    // Accumulate by the public subscription key:
+    // Accumulate by the public subscription key: list | recipientAddress |
+    // accountIdentityAddress for mailing list mail, otherwise
     // senderEmail | recipientAddress | accountIdentityAddress.
     const subs = {};
+
+    // Returns the list key when the message was counted for a mailing list.
+    async function scanMessage(m, isReply, folder, accountName, accountAddresses) {
+      const { name, email } = parseFromHeader(m.author);
+
+      const full = await withTimeout(
+        browser.messages.getFull(m.id), MESSAGE_FETCH_TIMEOUT_MS, `getFull(${m.id})`);
+      if (!full || !full.headers) return null;
+
+      const list = listIdentity(full.headers);
+      // Replies and forwards can contain unsubscribe links or headers
+      // belonging to quoted/nested messages, not the outer sender. List
+      // headers on a reply are added by the list server, so list replies
+      // count, using header methods only.
+      if (isReply && !list) return null;
+
+      const recipient = parseRecipientAddress(full, accountAddresses);
+      const recipientAddress = recipient.address;
+      const accountIdentityAddress = recipient.accountIdentityAddress || '';
+      if (recipientMatchesSkip(recipient, skipsRecipient)) return null;
+
+      const listUnsub = full.headers['list-unsubscribe'];
+      let urls = [];
+      let oneClick = false;
+      let embeddedUrl = null;
+
+      if (listUnsub && listUnsub.length > 0) {
+        urls = extractUnsubUrls(listUnsub[0]);
+        oneClick = !!(full.headers['list-unsubscribe-post'] &&
+                      full.headers['list-unsubscribe-post'].length > 0);
+      }
+
+      // Collect embedded links even when header-based methods exist so
+      // retry can offer every detected alternative.
+      if (!isReply) embeddedUrl = findEmbeddedUnsubLink(full);
+      if (urls.length === 0 && !embeddedUrl) return null;
+
+      scanState.subscriptionEmailsFound++;
+
+      if (!email) return null;
+
+      const key = list
+        ? listSubscriptionKey(list.key, recipientAddress, accountIdentityAddress)
+        : subscriptionKey(email, recipientAddress, accountIdentityAddress);
+
+      if (!subs[key]) {
+        subs[key] = {
+          subscriptionKey: key,
+          senderName: '',
+          senderNames: {},
+          // A list card shows the list's posting address where the sender
+          // address would be.
+          senderEmail: list ? (list.postAddress || list.key) : email,
+          recipientAddress,
+          accountIdentityAddress,
+          listId: list?.id || '',
+          ...(list ? {
+            isList: true,
+            listKey: list.key,
+            listPostAddress: list.postAddress,
+            listSource: list.source,
+            posterCounts: {}
+          } : {}),
+          emailCount: 0,
+          lastDate: '',
+          sampleSubject: '',
+          unsubCandidates: [],
+          oneClickCandidates: [],
+          embeddedCandidates: [],
+          methodCandidates: [],
+          detectionCounts: { header: 0, embedded: 0 },
+          detectionEvidence: [],
+          messageGroups: []
+        };
+      }
+
+      const s = subs[key];
+      s.emailCount++;
+      if (list) {
+        s.posterCounts[email] = (s.posterCounts[email] || 0) + 1;
+        if (!s.listPostAddress && list.postAddress) s.listPostAddress = list.postAddress;
+      }
+      const displayName = list ? list.name : name;
+      if (displayName) {
+        s.senderNames[displayName] = (s.senderNames[displayName] || 0) + 1;
+      }
+      const dateStr = m.date ? new Date(m.date).toISOString() : '';
+      if (dateStr && (!s.lastDate || dateStr > s.lastDate)) {
+        s.lastDate = dateStr;
+        s.sampleSubject = m.subject || '';
+      }
+
+      // Preserve candidate dates so the most recently received methods
+      // are preferred regardless of folder scan order.
+      for (const u of urls) {
+        s.unsubCandidates.push({ url: u, date: dateStr });
+        if (oneClick && u.startsWith('http')) {
+          s.oneClickCandidates.push({ url: u, date: dateStr });
+          s.methodCandidates.push({ type: 'oneclick', url: u, date: dateStr });
+        }
+        if (u.startsWith('mailto:')) s.methodCandidates.push({ type: 'mail', url: u, date: dateStr });
+        if (u.startsWith('http')) s.methodCandidates.push({ type: 'web', url: u, date: dateStr });
+      }
+      if (embeddedUrl) {
+        s.embeddedCandidates.push({ url: embeddedUrl, date: dateStr });
+        s.methodCandidates.push({ type: 'embedded', url: embeddedUrl, date: dateStr });
+      }
+
+      const headerMessageId = normalizeHeaderMessageId(m.headerMessageId || full.headers['message-id']);
+      addDetectionEvidence(s, {
+        headerMessageId,
+        subject: m.subject || '',
+        author: m.author || '',
+        date: dateStr,
+        accountName,
+        folderName: folder.name,
+        recipientSource: recipient.source,
+        accountIdentityAddress,
+        listId: list?.id || '',
+        sources: [
+          ...(urls.length > 0 ? ['header'] : []),
+          ...(embeddedUrl ? ['embedded'] : [])
+        ],
+        headerUrls: urls,
+        embeddedUrl,
+        contentTypes: collectContentTypes(full)
+      });
+      addToMessageGroups(s.messageGroups, accountName, folder.name, folder.id, m.id, headerMessageId);
+      scanState.sendersFound = Object.keys(subs).length;
+      return list ? key : null;
+    }
 
     for (let i = 0; i < allFolders.length; i++) {
       const { folder, accountName, accountAddresses, messageCount } = allFolders[i];
@@ -1045,6 +1217,10 @@ async function runScan() {
       try {
         let messageFailures = 0;
         let firstMessageFailure = null;
+        // Replies are only fetched once the folder is known to hold a
+        // discussion list, so personal replies elsewhere cost nothing.
+        const deferredReplies = [];
+        const folderListKeys = new Set();
         let page = await browser.messages.list(folder.id);
 
         pageLoop:
@@ -1058,116 +1234,17 @@ async function runScan() {
             scanState.progress = scanState.messagesScanned;
             processedInFolder++;
             try {
-              // Replies and forwards can contain unsubscribe links or headers
-              // belonging to quoted/nested messages, not the outer sender.
-              if (isReplyOrForwardSubject(m.subject)) continue;
-
               // Skip-listed senders are filtered before the body fetch.
-              const { name, email } = parseFromHeader(m.author);
+              const { email } = parseFromHeader(m.author);
               if (skipsSender && email && skipsSender(email)) continue;
 
-              const full = await withTimeout(
-                browser.messages.getFull(m.id), MESSAGE_FETCH_TIMEOUT_MS, `getFull(${m.id})`);
-              if (!full || !full.headers) continue;
-
-              const recipient = parseRecipientAddress(full, accountAddresses);
-              const recipientAddress = recipient.address;
-              const accountIdentityAddress = recipient.accountIdentityAddress || '';
-              if (recipientMatchesSkip(recipient, skipsRecipient)) continue;
-
-              const listUnsub = full.headers['list-unsubscribe'];
-              const listId = parseListId(full.headers);
-              let urls = [];
-              let oneClick = false;
-              let embeddedUrl = null;
-
-              if (listUnsub && listUnsub.length > 0) {
-                urls = extractUnsubUrls(listUnsub[0]);
-                oneClick = !!(full.headers['list-unsubscribe-post'] &&
-                              full.headers['list-unsubscribe-post'].length > 0);
+              if (isReplyOrForwardSubject(m.subject)) {
+                deferredReplies.push(m);
+                continue;
               }
 
-              // Collect embedded links even when header-based methods exist so
-              // retry can offer every detected alternative.
-              embeddedUrl = findEmbeddedUnsubLink(full);
-              if (urls.length === 0 && !embeddedUrl) continue;
-
-              scanState.subscriptionEmailsFound++;
-
-              if (!email) continue;
-
-              const key = subscriptionKey(email, recipientAddress, accountIdentityAddress);
-
-              if (!subs[key]) {
-                subs[key] = {
-                  subscriptionKey: key,
-                  senderName: '',
-                  senderNames: {},
-                  senderEmail: email,
-                  recipientAddress,
-                  accountIdentityAddress,
-                  listId,
-                  emailCount: 0,
-                  lastDate: '',
-                  sampleSubject: '',
-                  unsubCandidates: [],
-                  oneClickCandidates: [],
-                  embeddedCandidates: [],
-                  methodCandidates: [],
-                  detectionCounts: { header: 0, embedded: 0 },
-                  detectionEvidence: [],
-                  messageGroups: []
-                };
-              }
-
-              const s = subs[key];
-              s.emailCount++;
-              if (name) {
-                s.senderNames[name] = (s.senderNames[name] || 0) + 1;
-              }
-              const dateStr = m.date ? new Date(m.date).toISOString() : '';
-              if (dateStr && (!s.lastDate || dateStr > s.lastDate)) {
-                s.lastDate = dateStr;
-                s.sampleSubject = m.subject || '';
-              }
-
-              // Preserve candidate dates so the most recently received methods
-              // are preferred regardless of folder scan order.
-              for (const u of urls) {
-                s.unsubCandidates.push({ url: u, date: dateStr });
-                if (oneClick && u.startsWith('http')) {
-                  s.oneClickCandidates.push({ url: u, date: dateStr });
-                  s.methodCandidates.push({ type: 'oneclick', url: u, date: dateStr });
-                }
-                if (u.startsWith('mailto:')) s.methodCandidates.push({ type: 'mail', url: u, date: dateStr });
-                if (u.startsWith('http')) s.methodCandidates.push({ type: 'web', url: u, date: dateStr });
-              }
-              if (embeddedUrl) {
-                s.embeddedCandidates.push({ url: embeddedUrl, date: dateStr });
-                s.methodCandidates.push({ type: 'embedded', url: embeddedUrl, date: dateStr });
-              }
-
-              const headerMessageId = normalizeHeaderMessageId(m.headerMessageId || full.headers['message-id']);
-              addDetectionEvidence(s, {
-                headerMessageId,
-                subject: m.subject || '',
-                author: m.author || '',
-                date: dateStr,
-                accountName,
-                folderName: folder.name,
-                recipientSource: recipient.source,
-                accountIdentityAddress,
-                listId,
-                sources: [
-                  ...(urls.length > 0 ? ['header'] : []),
-                  ...(embeddedUrl ? ['embedded'] : [])
-                ],
-                headerUrls: urls,
-                embeddedUrl,
-                contentTypes: collectContentTypes(full)
-              });
-              addToMessageGroups(s.messageGroups, accountName, folder.name, folder.id, m.id, headerMessageId);
-              scanState.sendersFound = Object.keys(subs).length;
+              const listKey = await scanMessage(m, false, folder, accountName, accountAddresses);
+              if (listKey) folderListKeys.add(listKey);
             } catch (e) {
               messageFailures++;
               firstMessageFailure ||= e;
@@ -1184,6 +1261,27 @@ async function runScan() {
             break;
           }
         }
+
+        // A list with more than one poster is a discussion list, where most
+        // traffic is replies. Newsletters have a single poster.
+        const hasDiscussionList = [...folderListKeys]
+          .some(key => Object.keys(subs[key]?.posterCounts || {}).length > 1);
+        if (hasDiscussionList && deferredReplies.length > 0) {
+          console.log(`[ThunderSub] Checking ${deferredReplies.length} replies for list mail in: ${folderLabel}`);
+          for (const m of deferredReplies) {
+            while (scanState.paused && !scanState.stopped) {
+              await new Promise(r => setTimeout(r, 200));
+            }
+            if (scanState.stopped) break;
+            try {
+              await scanMessage(m, true, folder, accountName, accountAddresses);
+            } catch (e) {
+              messageFailures++;
+              firstMessageFailure ||= e;
+            }
+          }
+        }
+
         if (messageFailures > 0) {
           console.warn(`[ThunderSub] Skipped ${messageFailures} unreadable messages in: ${folderLabel}`, firstMessageFailure);
         }
@@ -1203,6 +1301,18 @@ async function runScan() {
       s.senderName = best;
       s._nameFreqs = names;
       delete s.senderNames;
+
+      if (s.isList) {
+        const posters = Object.entries(s.posterCounts)
+          .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+        s.senderName ||= s.listKey;
+        s.listName = s.senderName;
+        // Cleanup only acts on messages from these addresses (see
+        // resolveCurrentMessageIds).
+        s.listPosters = posters.map(([address]) => address);
+        s.topPosters = posters.slice(0, 5).map(([address, count]) => ({ address, count }));
+        delete s.posterCounts;
+      }
 
       s.unsubUrls = newestUniqueUrls(s.unsubCandidates);
       s.oneClickUrls = newestUniqueUrls(s.oneClickCandidates);
@@ -1228,12 +1338,16 @@ async function runScan() {
     for (const sub of existing) {
       existingMap[keyForSubscription(sub)] = sub;
     }
+    const migratedKeys = new Set();
 
     const now = new Date().toISOString();
     const merged = [];
 
     for (const [key, s] of Object.entries(subs)) {
-      const prev = existingMap[key];
+      let prev = existingMap[key];
+      if (!prev && s.isList) {
+        prev = migrateSenderDecisions(s, existing, migratedKeys);
+      }
 
       // A rescan re-evaluates everything, so prior errors and dismissals are
       // cleared: only 'keep'/'unsubscribed' decisions (and their dispose
@@ -1249,6 +1363,15 @@ async function runScan() {
         recipientAddress: s.recipientAddress,
         accountIdentityAddress: s.accountIdentityAddress || '',
         listId: s.listId || '',
+        ...(s.isList ? {
+          isList: true,
+          listKey: s.listKey,
+          listName: s.listName,
+          listPostAddress: s.listPostAddress || '',
+          listSource: s.listSource,
+          listPosters: s.listPosters,
+          topPosters: s.topPosters
+        } : {}),
         emailCount: s.emailCount,
         lastDate: s.lastDate,
         sampleSubject: s.sampleSubject,
@@ -1276,7 +1399,7 @@ async function runScan() {
 
     for (const prev of existing) {
       const k = keyForSubscription(prev);
-      if (!subs[k] && (prev.decision === 'keep' || prev.decision === 'unsubscribed')) {
+      if (!subs[k] && !migratedKeys.has(k) && (prev.decision === 'keep' || prev.decision === 'unsubscribed')) {
         merged.push({ ...prev, subscriptionKey: k });
       }
     }
@@ -1540,6 +1663,7 @@ async function junkEmails(key, senderEmail, recipientAddress, messageGroups) {
     junkFolderByAccountId[account.id] = await findJunkFolderId(account);
   }
 
+  const allowedSenders = await allowedSendersFor(key, senderEmail);
   let junked = 0;
   let movedToSpam = 0;
   let deleted = 0;
@@ -1547,7 +1671,7 @@ async function junkEmails(key, senderEmail, recipientAddress, messageGroups) {
   let totalIds = 0;
 
   for (const group of messageGroups) {
-    const { ids, unresolvedHeaderIds } = await resolveCurrentMessageIds([group], null, senderEmail);
+    const { ids, unresolvedHeaderIds } = await resolveCurrentMessageIds([group], null, allowedSenders);
     if (unresolvedHeaderIds.length > 0) {
       console.warn(`[ThunderSub] ${unresolvedHeaderIds.length} message(s) could not be re-resolved before junking:`, unresolvedHeaderIds);
     }
@@ -1607,7 +1731,8 @@ async function deleteEmails(key, senderEmail, recipientAddress, messageGroups, s
     return { deleted: 0 };
   }
 
-  const { ids, unresolvedHeaderIds, cancelled } = await resolveCurrentMessageIds(messageGroups, selectedFolders, senderEmail, traceId);
+  const allowedSenders = await allowedSendersFor(key, senderEmail);
+  const { ids, unresolvedHeaderIds, cancelled } = await resolveCurrentMessageIds(messageGroups, selectedFolders, allowedSenders, traceId);
   if (cancelled) return { deleted: 0, cancelled: true, actionCompleted: false };
   if (unresolvedHeaderIds.length > 0) {
     console.warn(`[ThunderSub] ${unresolvedHeaderIds.length} message(s) could not be re-resolved before delete (moved or removed):`, unresolvedHeaderIds);
@@ -1647,7 +1772,8 @@ async function moveEmails(key, senderEmail, recipientAddress, messageGroups, sel
     return { moved: 0 };
   }
 
-  const { ids, unresolvedHeaderIds, cancelled } = await resolveCurrentMessageIds(messageGroups, selectedFolders, senderEmail, traceId);
+  const allowedSenders = await allowedSendersFor(key, senderEmail);
+  const { ids, unresolvedHeaderIds, cancelled } = await resolveCurrentMessageIds(messageGroups, selectedFolders, allowedSenders, traceId);
   if (cancelled) return { moved: 0, cancelled: true, actionCompleted: false };
   if (unresolvedHeaderIds.length > 0) {
     console.warn(`[ThunderSub] ${unresolvedHeaderIds.length} message(s) could not be re-resolved before move (moved or removed):`, unresolvedHeaderIds);
@@ -1874,12 +2000,16 @@ async function viewSubscription(key, senderEmail) {
 
   const tab = await browser.mailTabs.create({});
   await browser.mailTabs.update(tab.id, { displayedFolder: folderId });
-  try {
-    await browser.mailTabs.setQuickFilter(tab.id, {
-      text: { text: senderEmail, author: true }
-    });
-  } catch (e) {
-    console.warn('[ThunderSub] Opened subscription folder but failed to apply sender filter', e);
+  // List mail comes from many posters but is addressed to the list.
+  const quickFilter = sub.isList
+    ? sub.listPostAddress && { text: sub.listPostAddress, recipients: true }
+    : { text: senderEmail, author: true };
+  if (quickFilter) {
+    try {
+      await browser.mailTabs.setQuickFilter(tab.id, { text: quickFilter });
+    } catch (e) {
+      console.warn('[ThunderSub] Opened subscription folder but failed to apply sender filter', e);
+    }
   }
 
   return { ok: true };

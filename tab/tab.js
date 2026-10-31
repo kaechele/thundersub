@@ -427,6 +427,12 @@ function sid(subscriptionKey) {
   return String(subscriptionKey || '').replace(/[^a-zA-Z0-9]/g, '_');
 }
 
+function listPostersLabel(sub) {
+  const count = sub.listPosters.length;
+  const top = (sub.topPosters || []).slice(0, 2).map(p => p.address).join(', ');
+  return `${count} ${count === 1 ? 'poster' : 'posters'}${top ? `: ${top}${count > 2 ? ', …' : ''}` : ''}`;
+}
+
 function senderLabel(sub) {
   if (sub.senderName) return `${sub.senderName} <${sub.senderEmail}>`;
   return sub.senderEmail;
@@ -1821,6 +1827,7 @@ function buildCard(s) {
 
   // Badges
   const badges = [el('span', { class: 'badge badge-blue' }, `${s.emailCount} emails`)];
+  if (s.isList) badges.push(el('span', { class: 'badge badge-neutral', title: s.listId || s.listKey || '' }, 'Mailing list'));
   if (s.processing) badges.push(el('span', { class: 'badge badge-processing' }, 'Processing'));
   if (s.decision === 'keep') badges.push(el('span', { class: 'badge badge-kept' }, 'Kept'));
   if (s.decision === 'unsubscribed') {
@@ -1871,6 +1878,10 @@ function buildCard(s) {
         el('span', {}, dateStr),
         el('span', {}, accountNames.join(', '))),
       s.recipientAddress && el('div', { class: 'card-accounts', title: `Delivered to ${s.recipientAddress}` }, `→ ${s.recipientAddress}`),
+      s.isList && s.listPosters?.length > 0 && el('div', {
+        class: 'card-accounts',
+        title: (s.topPosters || []).map(p => `${p.address} (${p.count})`).join('\n')
+      }, listPostersLabel(s)),
       s.sampleSubject && el('div', { class: 'card-subject', title: s.sampleSubject }, `"${s.sampleSubject.substring(0, 80)}"`),
       s.error?.message && el('div', {
         class: 'card-error', title: s.error.responseMessage || s.error.message
